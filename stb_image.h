@@ -586,6 +586,66 @@ STBIDEF void stbi_set_unpremultiply_on_load_thread(int flag_true_if_should_unpre
 STBIDEF void stbi_convert_iphone_png_to_rgb_thread(int flag_true_if_should_convert);
 STBIDEF void stbi_set_flip_vertically_on_load_thread(int flag_true_if_should_flip);
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// SUB-IMAGE VIEW - zero-copy rectangular view into an existing pixel buffer
+//
+// A stbi_view describes a rectangular sub-region of an image you already
+// have in memory (e.g. one decoded with stbi_load). Creating a view performs
+// no allocation and no pixel copying: the view's data pointer addresses
+// directly into the source buffer, which must outlive the view.
+//
+
+enum
+{
+   STBI_VIEW_OOB_CLAMP = 0, // shrink the view to the part of the rect inside the image
+   STBI_VIEW_OOB_FILL  = 1  // keep the requested size; pixels outside the image read as 'fill'
+};
+
+typedef struct
+{
+   int      alignment;   // required row-stride alignment in bytes (0 or 1 = no requirement)
+   int      oob_mode;    // STBI_VIEW_OOB_CLAMP or STBI_VIEW_OOB_FILL
+   stbi_uc  fill[4];     // fill color for out-of-bounds pixels in STBI_VIEW_OOB_FILL mode
+} stbi_view_options;
+
+typedef struct
+{
+   stbi_uc *data;        // pointer to the first in-bounds pixel of the view, inside the source buffer
+   int      width;       // view dimensions in pixels
+   int      height;
+   int      channels;    // bytes per pixel
+   int      stride;      // bytes per row (identical to the source buffer's stride)
+   int      origin_x;    // position of view pixel (0,0) in source-image coordinates
+   int      origin_y;
+   int      content_x;   // in-bounds content rectangle, in view coordinates: view pixel
+   int      content_y;   // (content_x,content_y) is at 'data', and the content_w x content_h
+   int      content_w;   // block starting there shares memory with the source image
+   int      content_h;
+   int      oob_mode;    // the out-of-bounds mode this view was created with
+   stbi_uc  fill[4];     // fill color reported for out-of-bounds pixels
+   stbi_uc *src_data;    // source buffer and its bounds, used by stbi_view_read
+   int      src_w;
+   int      src_h;
+} stbi_view;
+
+// create a sub-image view of the rectangle (x,y,w,h) of the image 'pixels'.
+// 'src_stride_bytes' is the source row stride in bytes; pass 0 for tightly
+// packed rows (img_w*channels). returns 1 on success, 0 on error:
+//   - the rectangle is empty (zero area) or lies completely outside the image
+//   - the stride is smaller than img_w*channels or violates options->alignment
+// In STBI_VIEW_OOB_CLAMP mode the view shrinks to the intersection of the
+// rectangle with the image. In STBI_VIEW_OOB_FILL mode the view keeps the
+// requested size and pixels outside the image read back as options->fill.
+STBIDEF int  stbi_view_init(stbi_view *view, stbi_uc *pixels, int img_w, int img_h, int channels, int src_stride_bytes,
+                            int x, int y, int w, int h, const stbi_view_options *options);
+
+// read the pixel at (x,y) in view coordinates into 'pixel_out' (must have
+// room for view->channels bytes). pixels outside the source image return
+// the view's fill color, as do coordinates outside the view itself.
+// never allocates, never reads out of bounds.
+STBIDEF void stbi_view_read(const stbi_view *view, int x, int y, stbi_uc *pixel_out);
+
 // ZLIB client - used by PNG, available for other purposes
 
 STBIDEF char *stbi_zlib_decode_malloc_guesssize(const char *buffer, int len, int initial_size, int *outlen);
@@ -7549,6 +7609,103 @@ STBIDEF int stbi_is_16_bit_from_callbacks(stbi_io_callbacks const *c, void *user
    r = stbi__info2_main(&s);
    stbi__stop(&s);
    return r.type != STBI_type_unsupported && r.is_16_bit;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// sub-image view (zero-copy crop)
+//
+
+STBIDEF int stbi_view_init(stbi_view *view, stbi_uc *pixels, int img_w, int img_h, int channels, int src_stride_bytes,
+                           int x, int y, int w, int h, const stbi_view_options *options)
+{
+   int stride, align = 1, mode = STBI_VIEW_OOB_CLAMP, i;
+   int ix0, iy0, ix1, iy1, re;
+   stbi_uc fill[4] = { 0, 0, 0, 0 };
+
+   if (view == NULL || pixels == NULL) return 0;
+   if (img_w <= 0 || img_h <= 0) return 0;
+   if (channels < 1 || channels > 4) return 0;
+   if (w <= 0 || h <= 0) return 0; // zero-area rectangle
+
+   stride = src_stride_bytes > 0 ? src_stride_bytes : img_w * channels;
+   if ((size_t) stride < (size_t) img_w * (size_t) channels) return 0;
+
+   if (options) {
+      if (options->alignment > 1) align = options->alignment;
+      mode = options->oob_mode;
+      for (i = 0; i < 4; ++i) fill[i] = options->fill[i];
+   }
+   if (mode != STBI_VIEW_OOB_CLAMP && mode != STBI_VIEW_OOB_FILL) return 0;
+   if ((size_t) stride % (size_t) align != 0) return 0; // alignment unsatisfiable without copying
+
+   // intersect the rectangle with the image, overflow-safe:
+   // x<0 and w>0 cannot overflow x+w; x>=0 implies x < img_w after the check below
+   ix0 = x < 0 ? 0 : x;
+   iy0 = y < 0 ? 0 : y;
+   if (ix0 >= img_w || iy0 >= img_h) return 0; // completely outside (right/bottom)
+   if (x + w <= 0 || y + h <= 0) return 0;     // completely outside (left/top)
+   re = (x >= 0 && w > img_w - x) ? img_w : x + w;
+   ix1 = re > img_w ? img_w : re;
+   re = (y >= 0 && h > img_h - y) ? img_h : y + h;
+   iy1 = re > img_h ? img_h : re;
+
+   view->channels = channels;
+   view->stride   = stride;
+   view->oob_mode = mode;
+   for (i = 0; i < 4; ++i) view->fill[i] = fill[i];
+   view->src_data = pixels;
+   view->src_w    = img_w;
+   view->src_h    = img_h;
+   view->data     = pixels + (size_t) iy0 * (size_t) stride + (size_t) ix0 * (size_t) channels;
+
+   if (mode == STBI_VIEW_OOB_CLAMP) {
+      // view shrinks to the intersection; content covers the whole view
+      view->width     = ix1 - ix0;
+      view->height    = iy1 - iy0;
+      view->origin_x  = ix0;
+      view->origin_y  = iy0;
+      view->content_x = 0;
+      view->content_y = 0;
+      view->content_w = view->width;
+      view->content_h = view->height;
+   } else {
+      // view keeps the requested size; only the content block shares memory
+      view->width     = w;
+      view->height    = h;
+      view->origin_x  = x;
+      view->origin_y  = y;
+      view->content_x = ix0 - x;
+      view->content_y = iy0 - y;
+      view->content_w = ix1 - ix0;
+      view->content_h = iy1 - iy0;
+   }
+   return 1;
+}
+
+STBIDEF void stbi_view_read(const stbi_view *view, int x, int y, stbi_uc *pixel_out)
+{
+   unsigned int usx, usy;
+   int i;
+
+   if (view == NULL || pixel_out == NULL) return;
+
+   // unsigned arithmetic: out-of-range sums wrap to huge values and fail the
+   // bounds checks below, so no signed overflow and no out-of-bounds access
+   usx = (unsigned int) x + (unsigned int) view->origin_x;
+   usy = (unsigned int) y + (unsigned int) view->origin_y;
+
+   if ((unsigned int) x < (unsigned int) view->width &&
+       (unsigned int) y < (unsigned int) view->height &&
+       usx < (unsigned int) view->src_w &&
+       usy < (unsigned int) view->src_h) {
+      memcpy(pixel_out,
+             view->src_data + (size_t) usy * (size_t) view->stride + (size_t) usx * (size_t) view->channels,
+             (size_t) view->channels);
+   } else {
+      for (i = 0; i < view->channels; ++i)
+         pixel_out[i] = view->fill[i];
+   }
 }
 
 #endif // STB_IMAGE_IMPLEMENTATION
