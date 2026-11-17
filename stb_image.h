@@ -424,6 +424,7 @@ enum
 };
 
 #include <stdlib.h>
+#include <stddef.h> // ptrdiff_t for stbi_view strides
 typedef unsigned char stbi_uc;
 typedef unsigned short stbi_us;
 
@@ -529,6 +530,38 @@ STBIDEF const char *stbi_failure_reason  (void);
 
 // free the loaded image -- this is just free()
 STBIDEF void     stbi_image_free      (void *retval_from_stbi_load);
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// flipped/strided views over a decoded 8-bit buffer
+//
+// A stbi_view aliases the decode buffer it was created from: creating one
+// performs NO allocation and copies NO pixels, and the view must not be
+// dereferenced after that buffer is released with stbi_image_free().
+// 'owner' records the aliased buffer so callers can track that lifetime
+// (see stbi_view_owner).
+//
+// Row-reversed views have a negative stride_y, column-reversed views have
+// a negative stride_x. stbi_view_at() resolves (x,y,c) through both
+// strides and returns 0 for out-of-range coordinates.
+
+typedef struct
+{
+   stbi_uc  *data;     // address of the view's logical pixel (0,0), channel 0
+   int       x;        // width  in pixels
+   int       y;        // height in pixels
+   int       comp;     // bytes per pixel (channels)
+   ptrdiff_t stride_x; // signed byte step from (x,y) to (x+1,y); negative when column-reversed
+   ptrdiff_t stride_y; // signed byte step from (x,y) to (x,y+1); negative when row-reversed
+   stbi_uc  *owner;    // decode buffer this view aliases (for lifetime tracking)
+} stbi_view;
+
+STBIDEF stbi_view stbi_view_make     (stbi_uc *data, int x, int y, int comp); // identity view
+STBIDEF stbi_view stbi_view_flip_rows(stbi_uc *data, int x, int y, int comp); // row order reversed
+STBIDEF stbi_view stbi_view_flip_cols(stbi_uc *data, int x, int y, int comp); // column order reversed
+STBIDEF stbi_view stbi_view_flip_both(stbi_uc *data, int x, int y, int comp); // rows and columns reversed
+STBIDEF stbi_uc   stbi_view_at(const stbi_view *view, int x, int y, int c);   // 0 if out of range
+STBIDEF stbi_uc  *stbi_view_owner(const stbi_view *view);                     // aliased decode buffer
 
 // get image dimensions, components, etc without fully decoding (new api)
 typedef struct
@@ -1162,6 +1195,64 @@ static int stbi__mul2shorts_valid(int a, int b)
 STBIDEF void stbi_image_free(void *retval_from_stbi_load)
 {
    STBI_FREE(retval_from_stbi_load);
+}
+
+STBIDEF stbi_view stbi_view_make(stbi_uc *data, int x, int y, int comp)
+{
+   stbi_view v;
+   v.data     = data;
+   v.x        = x;
+   v.y        = y;
+   v.comp     = comp;
+   v.stride_x = comp;
+   v.stride_y = (ptrdiff_t) x * comp;
+   v.owner    = data;
+   return v;
+}
+
+STBIDEF stbi_view stbi_view_flip_rows(stbi_uc *data, int x, int y, int comp)
+{
+   stbi_view v = stbi_view_make(data, x, y, comp);
+   if (y > 0)
+      v.data += (ptrdiff_t) (y - 1) * v.stride_y;
+   v.stride_y = -v.stride_y;
+   return v;
+}
+
+STBIDEF stbi_view stbi_view_flip_cols(stbi_uc *data, int x, int y, int comp)
+{
+   stbi_view v = stbi_view_make(data, x, y, comp);
+   if (x > 0)
+      v.data += (ptrdiff_t) (x - 1) * v.stride_x;
+   v.stride_x = -v.stride_x;
+   return v;
+}
+
+STBIDEF stbi_view stbi_view_flip_both(stbi_uc *data, int x, int y, int comp)
+{
+   stbi_view v = stbi_view_make(data, x, y, comp);
+   if (y > 0)
+      v.data += (ptrdiff_t) (y - 1) * v.stride_y;
+   if (x > 0)
+      v.data += (ptrdiff_t) (x - 1) * v.stride_x;
+   v.stride_y = -v.stride_y;
+   v.stride_x = -v.stride_x;
+   return v;
+}
+
+STBIDEF stbi_uc stbi_view_at(const stbi_view *view, int x, int y, int c)
+{
+   if ((unsigned) x >= (unsigned) view->x ||
+       (unsigned) y >= (unsigned) view->y ||
+       (unsigned) c >= (unsigned) view->comp)
+      return 0;
+   return view->data[(ptrdiff_t) y * view->stride_y +
+                     (ptrdiff_t) x * view->stride_x + c];
+}
+
+STBIDEF stbi_uc *stbi_view_owner(const stbi_view *view)
+{
+   return view->owner;
 }
 
 #ifndef STBI_NO_LINEAR
