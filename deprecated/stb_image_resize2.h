@@ -884,6 +884,52 @@ STBIRDEF void stbir_resize_split_profile_info( STBIR_PROFILE_INFO * out_info, ST
 #endif
 
 
+//===============================================================
+// High-quality separable resampler API
+//
+//   Adds two resampling kernels (Catmull-Rom bicubic and Lanczos3),
+//   an explicit area-average (box) antialiasing prefilter for downscaling,
+//   and an adaptive kernel radius whose upper bound is configurable.
+//
+//   The resampler is separable: each axis is resampled independently.
+//   On downscaling, when antialiasing is enabled, the axis is first
+//   reduced by exact area averaging (box filter) and only then kernel
+//   resampled, so the kernel stage never runs below a 0.5 ratio.
+//
+//   The kernel radius adapts to the per-stage scale ratio (its support
+//   is widened by 1/ratio on downscaling), and is clamped to
+//   options->max_radius. Setting max_radius to 1 forces bilinear
+//   interpolation and dispatches to the original stb path, producing
+//   bit-identical output to stbir_resize_uint8_linear()/
+//   stbir_resize_float_linear().
+//--------------------------------
+
+typedef enum
+{
+  STBIR_HQ_BICUBIC  = 0,   // Catmull-Rom bicubic, native radius 2
+  STBIR_HQ_LANCZOS3 = 1,   // Lanczos sinc kernel, native radius 3
+} stbir_hq_kernel;
+
+typedef struct stbir_hq_options
+{
+  stbir_hq_kernel kernel;      // resampling kernel
+  int             antialias;   // downscale: area-average prefilter before kernel resampling (nonzero = on)
+  int             max_radius;  // adaptive radius upper bound, 1..3; 1 forces bilinear (legacy bit-exact path)
+} stbir_hq_options;
+
+// fills in: LANCZOS3, antialias on, radius cap 3
+STBIRDEF void stbir_hq_options_default( stbir_hq_options * options );
+
+STBIRDEF unsigned char * stbir_resize_uint8_hq( const unsigned char *input_pixels , int input_w , int input_h, int input_stride_in_bytes,
+                                                          unsigned char *output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                                          stbir_pixel_layout pixel_layout, const stbir_hq_options * options );
+
+STBIRDEF float * stbir_resize_float_hq( const float *input_pixels , int input_w , int input_h, int input_stride_in_bytes,
+                                                  float *output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                                  stbir_pixel_layout pixel_layout, const stbir_hq_options * options );
+//===============================================================
+
+
 ////   end header file   /////////////////////////////////////////////////////
 #endif // STBIR_INCLUDE_STB_IMAGE_RESIZE2_H
 
@@ -10742,6 +10788,555 @@ static stbir__horizontal_gather_channels_func * STBIR_chans(stbir__horizontal_ga
 #undef STBIR_strs_join1
 
 #endif // STB_IMAGE_RESIZE_DO_HORIZONTALS/VERTICALS/CODERS
+
+#if !defined(STBIR_HQ_RESAMPLER_DEFINED)
+#define STBIR_HQ_RESAMPLER_DEFINED
+
+#if defined(STB_IMAGE_RESIZE_IMPLEMENTATION) || defined(STB_IMAGE_RESIZE2_IMPLEMENTATION)
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// High-quality separable resampler implementation
+//
+// Pipeline per axis (separable, horizontal pass then vertical pass):
+//   downscale + antialias:  area-average (box) prefilter, then kernel pass
+//   otherwise:              kernel pass only
+// The kernel pass support widens by 1/ratio when shrinking and is clamped
+// to options->max_radius. All intermediate data is float32.
+//
+// (the outer STBIR_HQ_RESAMPLER_DEFINED guard makes this compile once even
+//  though the header self-includes for template instantiation)
+//
+//////////////////////////////////////////////////////////////////////////////
+
+#include <math.h>   // sinf, floorf, ceilf (the header above only pulls it in conditionally)
+
+#define STBIR_HQ_PI 3.14159265358979323846f
+
+STBIRDEF void stbir_hq_options_default( stbir_hq_options * options )
+{
+  if ( !options ) return;
+  options->kernel     = STBIR_HQ_LANCZOS3;
+  options->antialias  = 1;
+  options->max_radius = 3;
+}
+
+// sinc for x != 0; sinc(0) = 1 by continuous extension
+static float stbir_hq__sinc( float x )
+{
+  float px;
+  if ( x == 0.0f ) return 1.0f;
+  px = STBIR_HQ_PI * x;
+  return sinf( px ) / px;
+}
+
+// kernel value at distance x; r_eff is the actual support radius in source
+// pixels used for this resampling pass (for Lanczos the window order tracks
+// the effective radius, so truncated passes stay normalized)
+static float stbir_hq__kernel( stbir_hq_kernel kernel, int r_eff, float x )
+{
+  float ax, xx, xx2;
+  if ( x < 0 ) x = -x;
+  if ( x >= (float) r_eff ) return 0.0f;
+  switch ( kernel )
+  {
+    case STBIR_HQ_BICUBIC:
+      // Catmull-Rom (B=0, C=0.5), standard piecewise cubic; native support 2
+      ax = x;
+      if ( ax >= 2.0f ) return 0.0f;
+      if ( ax < 1.0f )
+      {
+        xx2 = ax * ax;
+        return 1.5f * ax * xx2 - 2.5f * xx2 + 1.0f;
+      }
+      else // 1 <= ax < 2
+      {
+        xx = ax - 2.0f;
+        xx2 = xx * xx;
+        return -0.5f * xx * xx2;
+      }
+    case STBIR_HQ_LANCZOS3:
+    default:
+      return stbir_hq__sinc( x ) * stbir_hq__sinc( x / (float) r_eff );
+  }
+}
+
+// clamp source coordinate to valid range (edge clamp, matching default path)
+static int stbir_hq__clamp_coord( int c, int n )
+{
+  if ( c < 0 ) return 0;
+  if ( c >= n ) return n - 1;
+  return c;
+}
+
+// horizontal area-average (box) pass: n_in columns -> n_out columns,
+// exact per-output coverage weights. In/out floats, n_pixels rows.
+static void stbir_hq__area_horizontal( const float * in, int n_in, int n_pixels, int in_stride, int channels,
+                                             float * out, int n_out, int out_stride )
+{
+  int x, y, c;
+  float scale = (float) n_in / (float) n_out;
+  for ( x = 0; x < n_out; ++x )
+  {
+    float center = ( (float) x + 0.5f ) * scale;        // source-space center
+    float lo_f   = center - 0.5f * scale;               // source coverage [lo_f, hi_f)
+    float hi_f   = center + 0.5f * scale;
+    int   k0     = (int) floorf( lo_f );
+    int   k1     = (int) ceilf( hi_f ) - 1;
+    int   k, kc;
+
+    for ( y = 0; y < n_pixels; ++y )
+    {
+      const float * in_row = in + (size_t) y * in_stride;
+      float       * out_px = out + ( (size_t) y * out_stride + (size_t) x * channels );
+      float wsum = 0.0f;
+      for ( c = 0; c < channels; ++c ) out_px[c] = 0.0f;
+      for ( k = k0; k <= k1; ++k )
+      {
+        float cov_lo = (float) k;
+        float cov_hi = (float) k + 1.0f;
+        float w;
+        if ( cov_lo < lo_f ) cov_lo = lo_f;
+        if ( cov_hi > hi_f ) cov_hi = hi_f;
+        w = cov_hi - cov_lo;                       // coverage, may be 0 on integer boundaries
+        if ( w <= 0.0f ) continue;
+        kc = stbir_hq__clamp_coord( k, n_in );    // edge clamp folds outside coverage
+        {
+          const float * p = in_row + (size_t) kc * channels;
+          for ( c = 0; c < channels; ++c ) out_px[c] += p[c] * w;
+        }
+        wsum += w;
+      }
+      if ( wsum != 0.0f )
+        for ( c = 0; c < channels; ++c ) out_px[c] /= wsum;
+    }
+  }
+}
+
+// vertical area-average (box) pass
+static void stbir_hq__area_vertical( const float * in, int n_in, int n_cols, int in_stride, int channels,
+                                           float * out, int n_out, int out_stride )
+{
+  int y, x, c;
+  float scale = (float) n_in / (float) n_out;
+  for ( y = 0; y < n_out; ++y )
+  {
+    float center = ( (float) y + 0.5f ) * scale;
+    float lo_f   = center - 0.5f * scale;
+    float hi_f   = center + 0.5f * scale;
+    int   k0     = (int) floorf( lo_f );
+    int   k1     = (int) ceilf( hi_f ) - 1;
+    int   k;
+    float * out_row = out + (size_t) y * out_stride;
+    float wsum = 0.0f;
+
+    for ( x = 0; x < n_cols; ++x )
+      for ( c = 0; c < channels; ++c )
+        out_row[ (size_t) x * channels + c ] = 0.0f;
+
+    for ( k = k0; k <= k1; ++k )
+    {
+      float cov_lo = (float) k;
+      float cov_hi = (float) k + 1.0f;
+      float w;
+      int kc;
+      if ( cov_lo < lo_f ) cov_lo = lo_f;
+      if ( cov_hi > hi_f ) cov_hi = hi_f;
+      w = cov_hi - cov_lo;
+      if ( w <= 0.0f ) continue;
+      kc = stbir_hq__clamp_coord( k, n_in );
+      {
+        const float * in_row = in + (size_t) kc * in_stride;
+        for ( x = 0; x < n_cols; ++x )
+          for ( c = 0; c < channels; ++c )
+            out_row[ (size_t) x * channels + c ] += in_row[ (size_t) x * channels + c ] * w;
+      }
+      wsum += w;
+    }
+    if ( wsum != 0.0f )
+      for ( x = 0; x < n_cols; ++x )
+        for ( c = 0; c < channels; ++c )
+          out_row[ (size_t) x * channels + c ] /= wsum;
+  }
+}
+
+// horizontal kernel resampling pass, ratio = n_in/n_out
+static void stbir_hq__kernel_horizontal( const float * in, int n_in, int n_pixels, int in_stride, int channels,
+                                               float * out, int n_out, int out_stride,
+                                               stbir_hq_kernel kernel, int r_eff )
+{
+  int x, y, c;
+  float ratio = (float) n_in / (float) n_out;
+  for ( x = 0; x < n_out; ++x )
+  {
+    float center = ( (float) x + 0.5f ) * ratio - 0.5f;
+    int   c0     = (int) ceilf( center - (float) r_eff );
+    int   c1     = (int) floorf( center + (float) r_eff );
+    float wsum   = 0.0f;
+    int   k;
+    // small stack weight table; r_eff <= 3 so at most 7 taps
+    float wtab[8];
+
+    for ( k = c0; k <= c1; ++k )
+    {
+      float w = stbir_hq__kernel( kernel, r_eff, (float) k - center );
+      wtab[ k - c0 ] = w;
+      wsum += w;
+    }
+
+    for ( y = 0; y < n_pixels; ++y )
+    {
+      const float * in_row  = in + (size_t) y * in_stride;
+      float       * out_px  = out + ( (size_t) y * out_stride + (size_t) x * channels );
+      for ( c = 0; c < channels; ++c ) out_px[c] = 0.0f;
+      for ( k = c0; k <= c1; ++k )
+      {
+        int kc = stbir_hq__clamp_coord( k, n_in );
+        const float * p = in_row + (size_t) kc * channels;
+        float w = wtab[ k - c0 ] / wsum;
+        for ( c = 0; c < channels; ++c ) out_px[c] += p[c] * w;
+      }
+    }
+  }
+}
+
+// vertical kernel resampling pass, ratio = n_in/n_out
+static void stbir_hq__kernel_vertical( const float * in, int n_in, int n_cols, int in_stride, int channels,
+                                             float * out, int n_out, int out_stride,
+                                             stbir_hq_kernel kernel, int r_eff )
+{
+  int y, x, c;
+  float ratio = (float) n_in / (float) n_out;
+  for ( y = 0; y < n_out; ++y )
+  {
+    float center = ( (float) y + 0.5f ) * ratio - 0.5f;
+    int   c0     = (int) ceilf( center - (float) r_eff );
+    int   c1     = (int) floorf( center + (float) r_eff );
+    float wsum   = 0.0f;
+    int   k;
+    float wtab[8];
+
+    for ( k = c0; k <= c1; ++k )
+    {
+      float w = stbir_hq__kernel( kernel, r_eff, (float) k - center );
+      wtab[ k - c0 ] = w;
+      wsum += w;
+    }
+
+    {
+      float * out_row = out + (size_t) y * out_stride;
+      for ( x = 0; x < n_cols; ++x )
+        for ( c = 0; c < channels; ++c )
+          out_row[ (size_t) x * channels + c ] = 0.0f;
+      for ( k = c0; k <= c1; ++k )
+      {
+        int kc = stbir_hq__clamp_coord( k, n_in );
+        const float * in_row = in + (size_t) kc * in_stride;
+        float w = wtab[ k - c0 ] / wsum;
+        for ( x = 0; x < n_cols; ++x )
+          for ( c = 0; c < channels; ++c )
+            out_row[ (size_t) x * channels + c ] += in_row[ (size_t) x * channels + c ] * w;
+      }
+    }
+  }
+}
+
+// number of source pixels (floats per row slot) needed at the boundary
+// between two axis stages of a 2D resize (for scratch sizing)
+static size_t stbir_hq__axis_pixels( int n_in, int n_out, int antialias )
+{
+  if ( n_out == n_in ) return (size_t) n_in;
+  if ( antialias && n_out < n_in )
+  {
+    // area stage output n_area = ceil(n_in / floor(n_in/n_out)), with n_area <= 2*n_out
+    int s1 = n_in / n_out;
+    int n_area = ( n_in + s1 - 1 ) / s1;
+    if ( n_area < n_out ) n_area = n_out;
+    if ( n_area > 2 * n_out ) n_area = 2 * n_out;
+    if ( n_area > n_in ) n_area = n_in;
+    return (size_t) n_area;
+  }
+  return (size_t) n_in;
+}
+
+// effective kernel radius for a kernel pass of ratio n_in/n_out
+static int stbir_hq__effective_radius( stbir_hq_kernel kernel, int n_in, int n_out, int cap )
+{
+  int native = ( kernel == STBIR_HQ_LANCZOS3 ) ? 3 : 2;
+  float ratio = ( n_out > 0 ) ? (float) n_in / (float) n_out : 1.0f;
+  float support = (float) native * ( ratio > 1.0f ? ratio : 1.0f );
+  int r = (int) ceilf( support );
+  if ( r > cap ) r = cap;
+  if ( r < 1 ) r = 1;
+  if ( r > 3 ) r = 3;
+  return r;
+}
+
+// run the full per-axis plan on one axis; swaps *cur/**tmp and updates sizes
+static void stbir_hq__run_axis( float ** cur, float ** tmp, int horizontal,
+                                int n_in, int n_out, int n_other, int channels,
+                                int stride_cur, int antialias,
+                                stbir_hq_kernel kernel, int cap )
+{
+  if ( n_out == n_in ) return;
+
+  if ( antialias && n_out < n_in )
+  {
+    int s1 = n_in / n_out;
+    int n_area = ( n_in + s1 - 1 ) / s1;
+    int r_eff;
+    // compact intermediates. For a HORIZONTAL pass an image row is
+    // width*channels; for a VERTICAL pass the row width is unchanged and
+    // equals n_cols*channels (the resized axis is the row index).
+    int in_row_stride  = stride_cur;
+    int area_row_stride, out_row_stride;
+    if ( n_area < n_out ) n_area = n_out;
+    if ( n_area > 2 * n_out ) n_area = 2 * n_out;
+    if ( n_area > n_in ) n_area = n_in;
+
+    r_eff = stbir_hq__effective_radius( kernel, n_area, n_out, cap );
+
+    if ( n_area == n_out )
+    {
+      // the area box already reached the target size; the kernel pass
+      // would be a ratio-1 identity, so keep only the area result.
+      if ( horizontal )
+      {
+        area_row_stride = n_area * channels;
+        stbir_hq__area_horizontal( *cur, n_in, n_other, in_row_stride, channels, *tmp, n_area, area_row_stride );
+      }
+      else
+      {
+        area_row_stride = n_other * channels;
+        stbir_hq__area_vertical( *cur, n_in, n_other, in_row_stride, channels, *tmp, n_area, area_row_stride );
+      }
+      { float * t = *cur; *cur = *tmp; *tmp = t; }
+    }
+    else if ( horizontal )
+    {
+      area_row_stride = n_area * channels;
+      out_row_stride  = n_out  * channels;
+      // area lands in *tmp; kernel reads *tmp and writes the final image
+      // back into *cur, so the result stays in *cur and no swap is needed.
+      stbir_hq__area_horizontal( *cur, n_in, n_other, in_row_stride, channels, *tmp, n_area, area_row_stride );
+      stbir_hq__kernel_horizontal( *tmp, n_area, n_other, area_row_stride, channels, *cur, n_out, out_row_stride, kernel, r_eff );
+    }
+    else
+    {
+      area_row_stride = n_other * channels;   // columns are preserved on a vertical pass
+      out_row_stride  = n_other * channels;
+      stbir_hq__area_vertical( *cur, n_in, n_other, in_row_stride, channels, *tmp, n_area, area_row_stride );
+      stbir_hq__kernel_vertical( *tmp, n_area, n_other, area_row_stride, channels, *cur, n_out, out_row_stride, kernel, r_eff );
+    }
+  }
+  else
+  {
+    int r_eff = stbir_hq__effective_radius( kernel, n_in, n_out, cap );
+    int out_row_stride = horizontal ? ( n_out * channels ) : ( n_other * channels );
+    if ( horizontal )
+      stbir_hq__kernel_horizontal( *cur, n_in, n_other, stride_cur, channels, *tmp, n_out, out_row_stride, kernel, r_eff );
+    else
+      stbir_hq__kernel_vertical( *cur, n_in, n_other, stride_cur, channels, *tmp, n_out, out_row_stride, kernel, r_eff );
+    { float * t = *cur; *cur = *tmp; *tmp = t; }
+  }
+}
+
+// returns channel count, or 0 for an out-of-range layout value.
+// enum values: BGR=0, 1CH=1, 2CH=2, RGB=3, RGBA=4, 4CH=5, BGRA=6..AR=10, PM/NO_AW=11..16
+static int stbir_hq__channels( stbir_pixel_layout layout )
+{
+  static const unsigned char tab[17] = { 3,1,2,3,4,4,4,4,4,2,2,4,4,4,4,2,2 };
+  if ( (int) layout < 0 || (int) layout > 16 ) return 0;
+  return tab[ (int) layout ];
+}
+
+// shared float engine; input is float in [0,1]-ish range, output float
+static int stbir_hq__engine( const float * src, int in_w, int in_h, int in_stride_floats,
+                                   float * dst, int out_w, int out_h, int out_stride_floats,
+                                   int channels, const stbir_hq_options * opt )
+{
+  stbir_hq_options def;
+  stbir_hq_kernel kernel;
+  int antialias, cap;
+  size_t peak_h, pool_elems;
+  float * pool, * buf_a, * buf_b, * cur, * tmp;
+  int y, x, c;
+
+  if ( !opt ) { stbir_hq_options_default( &def ); opt = &def; }
+  kernel    = opt->kernel;
+  antialias = opt->antialias ? 1 : 0;
+  cap       = opt->max_radius;
+  if ( cap < 1 ) cap = 1;
+  if ( cap > 3 ) cap = 3;
+
+  // scratch peak: every buffer must hold either the full source image
+  // (horizontal stage starts with an in_w*in_h copy) or the widest/tallest
+  // intermediate seen by the vertical stage (peak_h rows of out_w floats).
+  peak_h = stbir_hq__axis_pixels( in_h, out_h, antialias );
+  if ( peak_h < (size_t) out_h ) peak_h = (size_t) out_h;
+  {
+    size_t h_size = (size_t) in_w * in_h * channels;
+    size_t v_size = peak_h * (size_t) out_w * channels;
+    pool_elems = ( h_size > v_size ) ? h_size : v_size;
+  }
+
+  pool = (float *) STBIR_MALLOC( pool_elems * 2 * sizeof( float ), 0 );
+  if ( !pool ) return 0;
+  buf_a = pool;
+  buf_b = pool + pool_elems;
+
+  // stage 1: horizontal, full height
+  cur = buf_a; tmp = buf_b;
+  // seed cur with the source image (copy, honoring stride)
+  for ( y = 0; y < in_h; ++y )
+  {
+    const float * srow = src + (size_t) y * in_stride_floats;
+    float * drow = cur + (size_t) y * in_w * channels;
+    for ( x = 0; x < in_w * channels; ++x ) drow[x] = srow[x];
+  }
+  stbir_hq__run_axis( &cur, &tmp, 1, in_w, out_w, in_h, channels,
+                      in_w * channels, antialias, kernel, cap );
+
+  // stage 2: vertical, width is now out_w
+  stbir_hq__run_axis( &cur, &tmp, 0, in_h, out_h, out_w, channels,
+                      out_w * channels, antialias, kernel, cap );
+
+  // store (cur holds the final image), clamp to [0,1]
+  for ( y = 0; y < out_h; ++y )
+  {
+    const float * srow = cur + (size_t) y * out_w * channels;
+    float * drow = dst + (size_t) y * out_stride_floats;
+    for ( x = 0; x < out_w; ++x )
+      for ( c = 0; c < channels; ++c )
+      {
+        float v = srow[ (size_t) x * channels + c ];
+        if ( v < 0.0f ) v = 0.0f; else if ( v > 1.0f ) v = 1.0f;
+        drow[ (size_t) x * channels + c ] = v;
+      }
+  }
+
+  STBIR_FREE( pool, 0 );
+  return 1;
+}
+
+STBIRDEF unsigned char * stbir_resize_uint8_hq( const unsigned char *input_pixels , int input_w , int input_h, int input_stride_in_bytes,
+                                                          unsigned char *output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                                          stbir_pixel_layout pixel_layout, const stbir_hq_options * options )
+{
+  stbir_hq_options def;
+  const stbir_hq_options * opt = options;
+  int channels, cap, y, x, c;
+  float * fsrc, * fdst;
+  unsigned char * out_owned = 0;
+
+  if ( input_w <= 0 || input_h <= 0 || output_w <= 0 || output_h <= 0 || !input_pixels )
+    return 0;
+  channels = stbir_hq__channels( pixel_layout );
+  if ( !channels ) return 0;
+  if ( !opt ) { stbir_hq_options_default( &def ); opt = &def; }
+  cap = opt->max_radius; if ( cap < 1 ) cap = 1; if ( cap > 3 ) cap = 3;
+
+  // radius cap 1: bilinear, bit-identical to the original stb path
+  if ( cap == 1 )
+    return stbir_resize_uint8_linear( input_pixels, input_w, input_h, input_stride_in_bytes,
+                                      output_pixels, output_w, output_h, output_stride_in_bytes, pixel_layout );
+
+  if ( !output_pixels )
+  {
+    output_pixels = (unsigned char *) STBIR_MALLOC( (size_t) output_w * output_h * channels, 0 );
+    if ( !output_pixels ) return 0;
+    out_owned = output_pixels;
+  }
+
+  fsrc = (float *) STBIR_MALLOC( (size_t) input_w * input_h * channels * sizeof( float ), 0 );
+  fdst = (float *) STBIR_MALLOC( (size_t) output_w * output_h * channels * sizeof( float ), 0 );
+  if ( !fsrc || !fdst )
+  {
+    if ( fsrc ) STBIR_FREE( fsrc, 0 );
+    if ( fdst ) STBIR_FREE( fdst, 0 );
+    if ( out_owned ) STBIR_FREE( out_owned, 0 );
+    return 0;
+  }
+
+  for ( y = 0; y < input_h; ++y )
+  {
+    const unsigned char * srow = input_pixels + (size_t) y * ( input_stride_in_bytes ? input_stride_in_bytes : input_w * channels );
+    float * drow = fsrc + (size_t) y * input_w * channels;
+    for ( x = 0; x < input_w * channels; ++x ) drow[x] = srow[x] * ( 1.0f / 255.0f );
+  }
+
+  if ( !stbir_hq__engine( fsrc, input_w, input_h, input_w * channels,
+                          fdst, output_w, output_h, output_w * channels,
+                          channels, opt ) )
+  {
+    STBIR_FREE( fsrc, 0 ); STBIR_FREE( fdst, 0 );
+    if ( out_owned ) STBIR_FREE( out_owned, 0 );
+    return 0;
+  }
+
+  for ( y = 0; y < output_h; ++y )
+  {
+    const float * srow = fdst + (size_t) y * output_w * channels;
+    unsigned char * drow = output_pixels + (size_t) y * ( output_stride_in_bytes ? output_stride_in_bytes : output_w * channels );
+    for ( x = 0; x < output_w; ++x )
+      for ( c = 0; c < channels; ++c )
+      {
+        float v = srow[ (size_t) x * channels + c ];
+        int q = (int) ( v * 255.0f + 0.5f );
+        if ( q < 0 ) q = 0; else if ( q > 255 ) q = 255;
+        drow[ (size_t) x * channels + c ] = (unsigned char) q;
+      }
+  }
+
+  STBIR_FREE( fsrc, 0 );
+  STBIR_FREE( fdst, 0 );
+  return output_pixels;
+}
+
+STBIRDEF float * stbir_resize_float_hq( const float *input_pixels , int input_w , int input_h, int input_stride_in_bytes,
+                                                  float *output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                                  stbir_pixel_layout pixel_layout, const stbir_hq_options * options )
+{
+  stbir_hq_options def;
+  const stbir_hq_options * opt = options;
+  int channels, cap;
+  size_t in_stride_f, out_stride_f;
+  float * out_owned = 0;
+
+  if ( input_w <= 0 || input_h <= 0 || output_w <= 0 || output_h <= 0 || !input_pixels )
+    return 0;
+  channels = stbir_hq__channels( pixel_layout );
+  if ( !channels ) return 0;
+  if ( !opt ) { stbir_hq_options_default( &def ); opt = &def; }
+  cap = opt->max_radius; if ( cap < 1 ) cap = 1; if ( cap > 3 ) cap = 3;
+
+  // radius cap 1: bilinear through the original stb path (triangle filter)
+  if ( cap == 1 )
+    return stbir_resize_float_linear( input_pixels, input_w, input_h, input_stride_in_bytes,
+                                      output_pixels, output_w, output_h, output_stride_in_bytes, pixel_layout );
+
+  if ( !output_pixels )
+  {
+    output_pixels = (float *) STBIR_MALLOC( (size_t) output_w * output_h * channels * sizeof( float ), 0 );
+    if ( !output_pixels ) return 0;
+    out_owned = output_pixels;
+  }
+  in_stride_f  = input_stride_in_bytes  ? (size_t) input_stride_in_bytes  / sizeof( float ) : (size_t) input_w  * channels;
+  out_stride_f = output_stride_in_bytes ? (size_t) output_stride_in_bytes / sizeof( float ) : (size_t) output_w * channels;
+
+  if ( !stbir_hq__engine( input_pixels, input_w, input_h, (int) in_stride_f,
+                          output_pixels, output_w, output_h, (int) out_stride_f,
+                          channels, opt ) )
+  {
+    if ( out_owned ) STBIR_FREE( out_owned, 0 );
+    return 0;
+  }
+  return output_pixels;
+}
+
+#endif // STB_IMAGE_RESIZE_IMPLEMENTATION / STB_IMAGE_RESIZE2_IMPLEMENTATION (high-quality resampler)
+
+#endif // STBIR_HQ_RESAMPLER_DEFINED (high-quality resampler)
 
 /*
 ------------------------------------------------------------------------------
